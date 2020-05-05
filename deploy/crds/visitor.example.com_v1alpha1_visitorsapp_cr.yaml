@@ -1,0 +1,7 @@
+apiVersion: visitor.example.com/v1alpha1
+kind: VisitorsApp
+metadata:
+  name: example-visitorsapp
+spec:
+  # Add fields here
+  size: 3
