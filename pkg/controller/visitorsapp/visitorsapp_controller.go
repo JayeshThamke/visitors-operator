@@ -2,16 +2,21 @@ package visitorsapp
 
 import (
 	"context"
+	"fmt"
+	"time"
 
-	visitorv1alpha1 "github.com/JayeshThamke/visitors-operator/pkg/apis/visitor/v1alpha1"
+	examplev1 "github.com/JayeshThamke/visitors-operator/pkg/apis/visitor/v1alpha1"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	//metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
+	//"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+
+	//"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -46,16 +51,24 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	}
 
 	// Watch for changes to primary resource VisitorsApp
-	err = c.Watch(&source.Kind{Type: &visitorv1alpha1.VisitorsApp{}}, &handler.EnqueueRequestForObject{})
+	err = c.Watch(&source.Kind{Type: &examplev1.VisitorsApp{}}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return err
 	}
 
 	// TODO(user): Modify this to be the types you create that are owned by the primary resource
 	// Watch for changes to secondary resource Pods and requeue the owner VisitorsApp
-	err = c.Watch(&source.Kind{Type: &corev1.Pod{}}, &handler.EnqueueRequestForOwner{
+	err = c.Watch(&source.Kind{Type: &appsv1.Deployment{}}, &handler.EnqueueRequestForOwner{
 		IsController: true,
-		OwnerType:    &visitorv1alpha1.VisitorsApp{},
+		OwnerType:    &examplev1.VisitorsApp{},
+	})
+	if err != nil {
+		return err
+	}
+
+	err = c.Watch(&source.Kind{Type: &corev1.Service{}}, &handler.EnqueueRequestForOwner{
+		IsController: true,
+		OwnerType:    &examplev1.VisitorsApp{},
 	})
 	if err != nil {
 		return err
@@ -87,8 +100,8 @@ func (r *ReconcileVisitorsApp) Reconcile(request reconcile.Request) (reconcile.R
 	reqLogger.Info("Reconciling VisitorsApp")
 
 	// Fetch the VisitorsApp instance
-	instance := &visitorv1alpha1.VisitorsApp{}
-	err := r.client.Get(context.TODO(), request.NamespacedName, instance)
+	v := &examplev1.VisitorsApp{}
+	err := r.client.Get(context.TODO(), request.NamespacedName, v)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			// Request object not found, could have been deleted after reconcile request.
@@ -100,8 +113,87 @@ func (r *ReconcileVisitorsApp) Reconcile(request reconcile.Request) (reconcile.R
 		return reconcile.Result{}, err
 	}
 
+	var result *reconcile.Result
+
+	// == MySQL ==========
+	result, err = r.ensureSecret(request, v, r.mysqlAuthSecret(v))
+	if result != nil {
+		return *result, err
+	}
+
+	result, err = r.ensureDeployment(request, v, r.mysqlDeployment(v))
+	if result != nil {
+		return *result, err
+	}
+
+	result, err = r.ensureService(request, v, r.mysqlService(v))
+	if result != nil {
+		return *result, err
+	}
+
+	mysqlRunning := r.isMysqlUp(v)
+
+	if !mysqlRunning {
+		// If MySQL isn't running yet, requeue the reconcile
+		// to run again after a delay
+		delay := time.Second * time.Duration(5)
+
+		log.Info(fmt.Sprintf("MySQL isn't running, waiting for %s", delay))
+		return reconcile.Result{RequeueAfter: delay}, nil
+	}
+
+	// == Visitors Backend  ==========
+	result, err = r.ensureDeployment(request, v, r.backendDeployment(v))
+	if result != nil {
+		return *result, err
+	}
+
+	result, err = r.ensureService(request, v, r.backendService(v))
+	if result != nil {
+		return *result, err
+	}
+
+	err = r.updateBackendStatus(v)
+	if err != nil {
+		// Requeue the request if the status could not be updated
+		return reconcile.Result{}, err
+	}
+
+	result, err = r.handleBackendChanges(v)
+	if result != nil {
+		return *result, err
+	}
+
+	// == Visitors Frontend ==========
+	result, err = r.ensureDeployment(request, v, r.frontendDeployment(v))
+	if result != nil {
+		return *result, err
+	}
+
+	result, err = r.ensureService(request, v, r.frontendService(v))
+	if result != nil {
+		return *result, err
+	}
+
+	err = r.updateFrontendStatus(v)
+	if err != nil {
+		// Requeue the request
+		return reconcile.Result{}, err
+	}
+
+	result, err = r.handleFrontendChanges(v)
+	if result != nil {
+		return *result, err
+	}
+
+	// == Finish ==========
+	// Everything went fine, don't requeue
+	return reconcile.Result{}, nil
+
+	/**
+	// ------------------------------------
 	// Define a new Pod object
-	pod := newPodForCR(instance)
+	pod := newPodForCR(v)
 
 	// Set VisitorsApp instance as the owner and controller
 	if err := controllerutil.SetControllerReference(instance, pod, r.scheme); err != nil {
@@ -127,10 +219,12 @@ func (r *ReconcileVisitorsApp) Reconcile(request reconcile.Request) (reconcile.R
 	// Pod already exists - don't requeue
 	reqLogger.Info("Skip reconcile: Pod already exists", "Pod.Namespace", found.Namespace, "Pod.Name", found.Name)
 	return reconcile.Result{}, nil
+	**/
 }
 
+/**
 // newPodForCR returns a busybox pod with the same name/namespace as the cr
-func newPodForCR(cr *visitorv1alpha1.VisitorsApp) *corev1.Pod {
+func newPodForCR(cr *examplev1.VisitorsApp) *corev1.Pod {
 	labels := map[string]string{
 		"app": cr.Name,
 	}
@@ -151,3 +245,4 @@ func newPodForCR(cr *visitorv1alpha1.VisitorsApp) *corev1.Pod {
 		},
 	}
 }
+**/

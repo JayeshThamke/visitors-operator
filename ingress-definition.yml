@@ -1,0 +1,13 @@
+apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: visitors-app-ingress
+spec:
+  rules:
+  - host: jay.visitors.on-demand.com
+    http:
+      paths:
+      - path: /
+        backend:
+          serviceName: example-visitorsapp-frontend-service
+          servicePort: 3000 
